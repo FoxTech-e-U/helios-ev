@@ -157,17 +157,31 @@ def read_u32(client, reg):
         return (r.registers[0] << 16) | r.registers[1]
     return None
 
-def write_u32(client, reg, value):
-    """Write a 32-bit unsigned value (2x16bit big-endian)."""
+def write_u32(client, reg, value, retries=3):
+    """Write a 32-bit unsigned value (2x16bit big-endian). Retries on failure."""
     hi = (value >> 16) & 0xFFFF
     lo = value & 0xFFFF
-    r = client.write_registers(reg, [hi, lo], unit=MODBUS_ADDRESS)
-    return not r.isError() if hasattr(r, 'isError') else False
+    for attempt in range(retries):
+        if attempt > 0:
+            time.sleep(0.5)
+        r = client.write_registers(reg, [hi, lo], unit=MODBUS_ADDRESS)
+        if hasattr(r, 'isError') and not r.isError():
+            return True
+        if hasattr(r, 'function_code') and r.function_code < 0x80:
+            return True
+    return False
 
-def write_u16(client, reg, value):
-    """Write a single 16-bit register."""
-    r = client.write_register(reg, value, unit=MODBUS_ADDRESS)
-    return not r.isError() if hasattr(r, 'isError') else False
+def write_u16(client, reg, value, retries=3):
+    """Write a single 16-bit register. Retries on failure."""
+    for attempt in range(retries):
+        if attempt > 0:
+            time.sleep(0.5)
+        r = client.write_register(reg, value, unit=MODBUS_ADDRESS)
+        if hasattr(r, 'isError') and not r.isError():
+            return True
+        if hasattr(r, 'function_code') and r.function_code < 0x80:
+            return True
+    return False
 
 def get_charging_state(client):
     """Return charging state (bits 6-0 of low byte)."""
@@ -211,7 +225,7 @@ class SolarCharger:
         self.surplus_above_min_since = None   # timestamp when surplus exceeded min
         self.surplus_below_min_since = None   # timestamp when surplus dropped below min
         self.daemon_started_charging = False  # True if we sent the start command
-        self.last_keepalive = 0
+        self.last_keepalive = time.time()
         self.running = True
 
         signal.signal(signal.SIGTERM, self._shutdown)
@@ -296,7 +310,7 @@ class SolarCharger:
             log.warning("Could not read ABB status from D-Bus")
             return
         # Charging state is bits 6-0 of low byte
-        state = int(abb_status) & 0x7F
+        state = (int(abb_status) >> 8) & 0x7F
 
         grid_w = get_grid_power()
         if grid_w is None:
@@ -324,7 +338,6 @@ class SolarCharger:
                 self.daemon_started_charging = False
                 self.surplus_above_min_since = None
                 self.surplus_below_min_since = None
-            log.info(f"[IDLE] Grid={grid_w:+.0f}W Surplus={surplus_w:.0f}W")
             return
 
         # Vehicle is connected (state >= 1) ─────────────────────────────────
@@ -338,9 +351,16 @@ class SolarCharger:
                 return
 
         # FORCE mode: full speed until vehicle unplugged
+
         if self.mode == Mode.FORCE:
-            log.debug(f"FORCE mode: charging at {MAX_CURRENT}A")
-            set_current(client, MAX_CURRENT)
+            if state != STATE_CHARGING:
+                # Charging stopped (via app or RFID) → back to PV_WAIT
+                log.info(f"Charging stopped externally → PV_WAIT")
+                self.mode = Mode.PV_WAIT
+                self.daemon_started_charging = False
+                self.surplus_above_min_since = None
+            else:
+                log.info(f"[FORCE] Charging at {MAX_CURRENT}A")
             return
 
         # PV modes ────────────────────────────────────────────────────────────
@@ -375,7 +395,8 @@ class SolarCharger:
             if target_a >= MIN_CURRENT:
                 # Sufficient surplus → adjust current
                 self.surplus_below_min_since = None
-                current_a = dbus_get('com.victronenergy.evcharger.abb_terra_ac_2', '/Current') or 0
+                current_raw = read_u32(client, REG_CURRENT_LIMIT)
+                current_a = (current_raw / 1000) if current_raw else 0
                 # Only write if change is > 0.5A to avoid constant bus traffic
                 if abs(target_a - current_a) > 0.5:
                     log.info(f"Adjusting charge current: {current_a:.1f}A → {target_a:.1f}A "
