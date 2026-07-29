@@ -3,26 +3,33 @@
 # Helios EV Installation Script
 # ================================
 #
-# Installs ABB Terra AC Wallbox integration and PV surplus charging daemon
-# on Victron Cerbo GX.
+# Installs the ABB Terra AC PV surplus charging daemon on Victron Cerbo GX.
+# The daemon owns the RS485 bus for the ABB exclusively - it reads AND
+# writes directly via Modbus and publishes its own D-Bus service. It does
+# NOT rely on dbus-modbus-client for the ABB.
+#
+# Why: dbus-modbus-client (reading the ABB) and an earlier version of this
+# daemon (writing SetCurrent/Start/Stop) both accessed the RS485 bus
+# independently, causing collisions and repeated dbus-modbus-client
+# crashes. Exclusive bus ownership fixes this at the root.
+#
 # Compatible with Venus OS 3.70+ (read-only filesystem).
 #
 # Usage (run directly on Cerbo GX):
 #   wget -O /tmp/install.sh https://raw.githubusercontent.com/FoxTech-e-U/helios-ev/master/install.sh
-#   bash /tmp/install.sh
+#   bash /tmp/install.sh [ttyUSBX] [modbus-address]
 #
-# Or if you have the repo cloned locally:
-#   ./install.sh
+# Example:
+#   bash /tmp/install.sh ttyUSB1 2
 #
 
 set -e
 
 REPO_URL="https://raw.githubusercontent.com/FoxTech-e-U/helios-ev/master"
-DATA_DIR="/data/helios-ev"
 DAEMON_DIR="/data/helios-abb-terra-ac"
 TARGET_DIR="/opt/victronenergy/dbus-modbus-client"
 RC_LOCAL="/data/rc.local"
-RC_MARKER="# helios-ev"
+SERVICE_DIR="/service/helios-abb-solar-charger"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -38,213 +45,196 @@ print_header()  { echo ""; echo "========================================="; ech
 
 [ "$EUID" -ne 0 ] && { print_error "Please run as root"; exit 1; }
 
-print_header "⚡ Helios EV Installation"
+print_header "⚡ Helios EV Installation (exclusive RTU bus)"
+
+DEVICE="${1:-ttyUSB1}"
+MODBUS_ADDR="${2:-2}"
 
 # ---------------------------------------------------------------------------
-# Step 1: Get files
+# Step 1: Get daemon file
 # ---------------------------------------------------------------------------
-print_header "Step 1: Get Files"
+print_header "Step 1: Get Daemon"
 
-if [ -f "abb_terra.py" ]; then
-    print_info "Using local files"
-    ABB_TERRA_PY="abb_terra.py"
+if [ -f "helios-abb-solar-charger.py" ]; then
+    print_info "Using local helios-abb-solar-charger.py"
     DAEMON_PY="helios-abb-solar-charger.py"
 else
-    print_info "Downloading files from GitHub..."
-    wget -q -O /tmp/abb_terra.py "$REPO_URL/abb_terra.py" || {
-        print_error "Download of abb_terra.py failed."; exit 1
-    }
+    print_info "Downloading from GitHub..."
     wget -q -O /tmp/helios-abb-solar-charger.py "$REPO_URL/helios-abb-solar-charger.py" || {
-        print_error "Download of helios-abb-solar-charger.py failed."; exit 1
+        print_error "Download failed."; exit 1
     }
-    ABB_TERRA_PY="/tmp/abb_terra.py"
     DAEMON_PY="/tmp/helios-abb-solar-charger.py"
-    print_success "Files downloaded"
+    print_success "Downloaded"
 fi
 
 # ---------------------------------------------------------------------------
-# Step 2: Install abb_terra.py to /data/ with symlink and import patch
+# Step 2: Remove any legacy dbus-modbus-client ABB plugin (avoid bus conflict)
 # ---------------------------------------------------------------------------
-print_header "Step 2: Install ABB Terra Plugin"
+print_header "Step 2: Remove Legacy dbus-modbus-client Plugin"
 
-mkdir -p "$DATA_DIR"
-cp "$ABB_TERRA_PY" "$DATA_DIR/abb_terra.py"
-chmod 644 "$DATA_DIR/abb_terra.py"
-print_success "abb_terra.py installed to $DATA_DIR/"
+if [ -f "$TARGET_DIR/abb_terra.py" ] || grep -q "^import abb_terra$" "$TARGET_DIR/dbus-modbus-client.py" 2>/dev/null; then
+    print_warning "Legacy abb_terra.py plugin detected - removing to avoid RS485 bus conflict"
+    mount -o remount,rw /
+    sed -i '/^import abb_terra$/d' "$TARGET_DIR/dbus-modbus-client.py" 2>/dev/null || true
+    rm -f "$TARGET_DIR/abb_terra.py"
+    rm -rf "$TARGET_DIR/__pycache__/" 2>/dev/null || true
+    mount -o remount,ro /
+    print_success "Legacy plugin removed"
 
-print_info "Patching filesystem (remount rw)..."
-mount -o remount,rw /
-
-# Symlink
-[ -f "$TARGET_DIR/abb_terra.py" ] && [ ! -L "$TARGET_DIR/abb_terra.py" ] && \
-    cp "$TARGET_DIR/abb_terra.py" "$TARGET_DIR/abb_terra.py.backup.$(date +%Y%m%d_%H%M%S)"
-ln -sf "$DATA_DIR/abb_terra.py" "$TARGET_DIR/abb_terra.py"
-print_success "Symlink: $TARGET_DIR/abb_terra.py → $DATA_DIR/abb_terra.py"
-
-# Patch dbus-modbus-client.py to import abb_terra
-if ! grep -q "import abb_terra" "$TARGET_DIR/dbus-modbus-client.py"; then
-    sed -i 's/^import victron_em$/import victron_em\nimport abb_terra/' \
-        "$TARGET_DIR/dbus-modbus-client.py"
-    print_success "Added 'import abb_terra' to dbus-modbus-client.py"
+    # Remove old rc.local entries for it
+    sed -i "/# helios-ev$/,/^mount -o remount,ro \//d" "$RC_LOCAL" 2>/dev/null || true
 else
-    print_info "dbus-modbus-client.py already imports abb_terra"
+    print_info "No legacy plugin found"
 fi
 
-# Clear pycache
-rm -rf "$TARGET_DIR/__pycache__/" 2>/dev/null || true
+# ---------------------------------------------------------------------------
+# Step 3: Ensure dbus-modbus-client does not scan this ABB address
+# ---------------------------------------------------------------------------
+print_header "Step 3: Exclude ABB from dbus-modbus-client"
 
-mount -o remount,ro /
-print_success "Filesystem restored to read-only"
+CURRENT_DEVICES=$(dbus -y com.victronenergy.settings /Settings/ModbusClient/${DEVICE}/Devices GetValue 2>/dev/null || echo "")
+NEW_DEVICES=$(echo "$CURRENT_DEVICES" | sed "s/rtu:${DEVICE}:9600:${MODBUS_ADDR}//g" | sed 's/,,/,/g' | sed 's/^,//;s/,$//')
+
+dbus -y com.victronenergy.settings /Settings/ModbusClient/${DEVICE}/Devices SetValue "$NEW_DEVICES" >/dev/null 2>&1
+print_success "dbus-modbus-client Devices for $DEVICE: '$NEW_DEVICES' (address $MODBUS_ADDR excluded)"
+
+svc -t /service/dbus-modbus-client.serial.${DEVICE} 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# Step 3: Install solar charger daemon
+# Step 4: Install daemon
 # ---------------------------------------------------------------------------
-print_header "Step 3: Install Solar Charger Daemon"
+print_header "Step 4: Install Daemon"
 
 mkdir -p "$DAEMON_DIR"
 cp "$DAEMON_PY" "$DAEMON_DIR/helios-abb-solar-charger.py"
+sed -i "s#^MODBUS_PORT    = '.*'#MODBUS_PORT    = '/dev/${DEVICE}'#" "$DAEMON_DIR/helios-abb-solar-charger.py"
+sed -i "s/^MODBUS_ADDRESS = .*/MODBUS_ADDRESS = ${MODBUS_ADDR}          # ABB Terra AC address/" "$DAEMON_DIR/helios-abb-solar-charger.py"
 chmod 755 "$DAEMON_DIR/helios-abb-solar-charger.py"
-print_success "Daemon installed to $DAEMON_DIR/"
+print_success "Installed to $DAEMON_DIR/ (port: /dev/$DEVICE, address: $MODBUS_ADDR)"
 
 # ---------------------------------------------------------------------------
-# Step 4: Persist via rc.local
+# Step 5: Verify connectivity (before daemon takes exclusive ownership)
 # ---------------------------------------------------------------------------
-print_header "Step 4: Persist via rc.local"
+print_header "Step 5: Verify ABB Connectivity"
 
-if ! grep -q "$RC_MARKER" "$RC_LOCAL" 2>/dev/null; then
-    cat >> "$RC_LOCAL" << EOF
-
-$RC_MARKER
-mount -o remount,rw /
-ln -sf $DATA_DIR/abb_terra.py $TARGET_DIR/abb_terra.py
-if ! grep -q "import abb_terra" $TARGET_DIR/dbus-modbus-client.py; then
-    sed -i 's/^import victron_em\$/import victron_em\\nimport abb_terra/' $TARGET_DIR/dbus-modbus-client.py
-fi
-rm -rf $TARGET_DIR/__pycache__/ 2>/dev/null || true
-mount -o remount,ro /
-EOF
-    chmod +x "$RC_LOCAL"
-    print_success "rc.local updated (auto-restore after firmware updates)"
-else
-    print_info "rc.local already has helios-ev entry"
-fi
-
-# ---------------------------------------------------------------------------
-# Step 5: Verify connectivity
-# ---------------------------------------------------------------------------
-print_header "Step 5: Verify Configuration"
-
-print_info "Checking ABB Terra on Modbus RTU..."
-python3 - << 'PYEOF'
+python3 - "$DEVICE" "$MODBUS_ADDR" << 'PYEOF'
 import sys, time
 from pymodbus.client.sync import ModbusSerialClient
-c = ModbusSerialClient(method='rtu', port='/dev/ttyUSB1',
+dev, addr = sys.argv[1], int(sys.argv[2])
+c = ModbusSerialClient(method='rtu', port=f'/dev/{dev}',
     baudrate=9600, bytesize=8, parity='N', stopbits=1, timeout=3)
 c.connect()
 time.sleep(1)
-r = c.read_holding_registers(0x4006, 2, unit=2)
+r = c.read_holding_registers(0x4006, 2, unit=addr)
 if hasattr(r, 'registers'):
     ma = (r.registers[0] << 16) | r.registers[1]
-    print(f"  ABB Terra found: MaxCurrent = {ma/1000:.0f}A")
+    print(f"  OK - ABB Terra MaxCurrent = {ma/1000:.0f}A")
 else:
-    print("  WARNING: ABB Terra not responding - check wiring and address")
+    print(f"  WARNING: no response - check wiring/address")
 c.close()
 PYEOF
-
-print_info "Checking grid meter on D-Bus..."
-GRID=$(dbus -y com.victronenergy.grid.cgwacs_ttyUSB0_mb1 /Ac/Power GetValue 2>/dev/null || echo "N/A")
-[ "$GRID" != "N/A" ] && print_success "Grid meter: ${GRID}W" || \
-    print_warning "Grid meter not found - check GRID_SERVICE in daemon config"
 
 # ---------------------------------------------------------------------------
 # Step 6: Install runit service
 # ---------------------------------------------------------------------------
 print_header "Step 6: Install Service"
 
-SERVICE_DIR="/service/helios-abb-solar-charger"
 mkdir -p "$SERVICE_DIR/log"
-
-cat > "$SERVICE_DIR/run" << 'RUNEOF'
+cat > "$SERVICE_DIR/run" << RUNEOF
 #!/bin/sh
-exec /usr/bin/python3 -u /data/helios-abb-terra-ac/helios-abb-solar-charger.py 2>&1
+exec /usr/bin/python3 -u ${DAEMON_DIR}/helios-abb-solar-charger.py 2>&1
 RUNEOF
-
 cat > "$SERVICE_DIR/log/run" << 'LOGEOF'
 #!/bin/sh
 exec multilog t s25000 n4 /var/log/helios-abb-solar-charger
 LOGEOF
-
 chmod 755 "$SERVICE_DIR/run"
 chmod 755 "$SERVICE_DIR/log/run"
 
-# Save service scripts to /data/ for rc.local restore
-mkdir -p "$DATA_DIR/service/helios-abb-solar-charger/log"
-cp "$SERVICE_DIR/run" "$DATA_DIR/service/helios-abb-solar-charger/"
-cp "$SERVICE_DIR/log/run" "$DATA_DIR/service/helios-abb-solar-charger/log/"
-chmod 755 "$DATA_DIR/service/helios-abb-solar-charger/run"
-chmod 755 "$DATA_DIR/service/helios-abb-solar-charger/log/run"
-
-# Add service restore to rc.local
-if ! grep -q "helios-abb-solar-charger" "$RC_LOCAL" 2>/dev/null; then
-    cat >> "$RC_LOCAL" << 'EOF'
-
-# helios-ev service restore
-if [ ! -f /service/helios-abb-solar-charger/run ]; then
-    mkdir -p /service/helios-abb-solar-charger/log
-    cp /data/helios-ev/service/helios-abb-solar-charger/run /service/helios-abb-solar-charger/
-    cp /data/helios-ev/service/helios-abb-solar-charger/log/run /service/helios-abb-solar-charger/log/
-    chmod 755 /service/helios-abb-solar-charger/run
-    chmod 755 /service/helios-abb-solar-charger/log/run
-fi
-EOF
-fi
+mkdir -p "$DAEMON_DIR/service/helios-abb-solar-charger/log"
+cp "$SERVICE_DIR/run" "$DAEMON_DIR/service/helios-abb-solar-charger/"
+cp "$SERVICE_DIR/log/run" "$DAEMON_DIR/service/helios-abb-solar-charger/log/"
+chmod 755 "$DAEMON_DIR/service/helios-abb-solar-charger/run"
+chmod 755 "$DAEMON_DIR/service/helios-abb-solar-charger/log/run"
 
 print_success "runit service installed: $SERVICE_DIR"
 
 # ---------------------------------------------------------------------------
-# Step 7: Start service
+# Step 7: Persist via rc.local
 # ---------------------------------------------------------------------------
-print_header "Step 7: Start Service"
+print_header "Step 7: Persist via rc.local"
+
+RC_MARKER="# helios-ev exclusive-rtu"
+if ! grep -q "$RC_MARKER" "$RC_LOCAL" 2>/dev/null; then
+    cat >> "$RC_LOCAL" << EOF
+
+$RC_MARKER
+# Ensure dbus-modbus-client never re-acquires the ABB address after an update
+dbus -y com.victronenergy.settings /Settings/ModbusClient/${DEVICE}/Devices SetValue "$NEW_DEVICES" 2>/dev/null || true
+if [ ! -f $SERVICE_DIR/run ]; then
+    mkdir -p $SERVICE_DIR/log
+    cp $DAEMON_DIR/service/helios-abb-solar-charger/run $SERVICE_DIR/
+    cp $DAEMON_DIR/service/helios-abb-solar-charger/log/run $SERVICE_DIR/log/
+    chmod 755 $SERVICE_DIR/run
+    chmod 755 $SERVICE_DIR/log/run
+fi
+EOF
+    chmod +x "$RC_LOCAL"
+    print_success "rc.local updated (auto-restore + bus exclusion after firmware updates)"
+else
+    print_info "rc.local already configured"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 8: Start service
+# ---------------------------------------------------------------------------
+print_header "Step 8: Start Service"
 
 touch "$SERVICE_DIR/down"
 sleep 1
 rm -f "$SERVICE_DIR/down"
-sleep 3
+sleep 5
 
 STATUS=$(svstat "$SERVICE_DIR" 2>/dev/null || echo "unknown")
 echo "  $STATUS"
 echo "$STATUS" | grep -q "up" && print_success "Service running" || print_warning "Service starting..."
 
 # ---------------------------------------------------------------------------
-# Step 8: Restart dbus-modbus-client
+# Step 9: Verify D-Bus service
 # ---------------------------------------------------------------------------
-print_header "Step 8: Restart Services"
+print_header "Step 9: Verification"
 
-svc -t /service/dbus-modbus-client.serial.ttyUSB1 2>/dev/null || true
-svc -t /service/serial-starter
-print_success "Services restarted"
-
-sleep 35
-dbus -y | grep -q "abb_terra" && \
-    print_success "ABB Terra found on D-Bus" || \
-    print_warning "ABB Terra not yet on D-Bus - may need a few more seconds"
+sleep 15
+if dbus -y 2>/dev/null | grep -q "abb_terra"; then
+    print_success "D-Bus service active: com.victronenergy.evcharger.abb_terra_ac_2"
+    CONNECTED=$(dbus -y com.victronenergy.evcharger.abb_terra_ac_2 /Connected GetValue 2>/dev/null || echo "N/A")
+    echo "  Connected: $CONNECTED"
+else
+    print_warning "D-Bus service not detected yet - check logs:"
+    echo "  tail -f /var/log/helios-abb-solar-charger/current | tai64nlocal"
+fi
 
 # ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
 print_header "✅ Installation Complete!"
-echo "  Plugin:     $DATA_DIR/abb_terra.py"
-echo "  Symlink:    $TARGET_DIR/abb_terra.py"
-echo "  Import:     patched into dbus-modbus-client.py"
 echo "  Daemon:     $DAEMON_DIR/helios-abb-solar-charger.py"
 echo "  Service:    $SERVICE_DIR"
 echo "  Persistent: $RC_LOCAL"
 echo ""
 echo "Monitor:"
 echo "  tail -f /var/log/helios-abb-solar-charger/current | tai64nlocal"
+echo "  dbus -y com.victronenergy.evcharger.abb_terra_ac_2 / GetValue"
 echo ""
-echo "To update to latest version:"
-echo "  wget -O /tmp/install.sh $REPO_URL/install.sh && bash /tmp/install.sh"
+echo "⚠ IMPORTANT: This daemon requires EXCLUSIVE access to $DEVICE address $MODBUS_ADDR."
+echo "  No other process (dbus-modbus-client, another script) may read or write"
+echo "  this address on the same RS485 bus - even brief concurrent access causes"
+echo "  half-duplex collisions and repeated 'no response' errors."
+echo ""
+echo "⚠ If a Huawei SUN2000 (or any other RS485 device using TCP/other transport)"
+echo "  was ever wired to the same bus, its RS485 connection must be physically"
+echo "  disconnected - some inverters keep transmitting on RS485 even when not"
+echo "  being polled, which corrupts communication for every other device sharing"
+echo "  the same wire."
 echo ""
 print_success "Done! ⚡"
-
