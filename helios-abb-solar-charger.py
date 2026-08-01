@@ -342,25 +342,19 @@ class SolarCharger:
         svc = self.service
         ok_any = False
 
-        log.debug("Reading REG_MAX_CURRENT...")
         val = read_u32(client, REG_MAX_CURRENT)
-        log.debug(f"REG_MAX_CURRENT = {val}")
         if val is not None:
             svc['/MaxCurrent'] = round(val / 1000, 1)
             ok_any = True
         time.sleep(0.1)
 
-        log.debug("Reading REG_ERROR_CODE...")
         val = read_u32(client, REG_ERROR_CODE)
-        log.debug(f"REG_ERROR_CODE = {val}")
         if val is not None:
             svc['/ErrorCode'] = val
             ok_any = True
         time.sleep(0.1)
 
-        log.debug("Reading REG_CHARGING_STATE...")
         status_raw = read_u32(client, REG_CHARGING_STATE)
-        log.debug(f"REG_CHARGING_STATE = {status_raw}")
         state = None
         if status_raw is not None:
             svc['/Status'] = status_raw
