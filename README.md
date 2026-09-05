@@ -48,11 +48,14 @@ earlier testing of this project.
 - ✅ **Native Victron Integration** — EV Charger in Device List and VRM, no separate plugin
 - ✅ **Exclusive RS485 ownership** — eliminates the bus-collision class of failures entirely
 - ✅ **PV Surplus Charging** — dynamic current control (6–16A) based on solar surplus
-- ✅ **Force Charge Mode** — RFID tap or ABB app → charges at full power immediately
+- ✅ **Force Charge Mode** — RFID tap or ABB app/ChargerSync → charges at full power immediately
 - ✅ **Smart Hysteresis** — 60s before starting, 300s before stopping (avoids rapid switching)
 - ✅ **RFID Support** — vehicle plugged in waits for RFID authorization before PV charging
-- ✅ **Fully-charged vehicle handling** — detects when the vehicle stops drawing current
-  despite an active session (e.g. reached 100%) and stops retrying every cycle
+- ✅ **Restart-safe** — resumes an already-active PV session correctly on daemon restart
+  instead of misreading it as an external trigger and forcing max current
+- ✅ **Fully-charged / paused vehicle handling** — keeps nudging a (harmless, idempotent)
+  start command every cycle whenever surplus is sufficient but the ABB isn't reporting
+  an active charge, instead of getting permanently stuck waiting for a state change
 - ✅ **Venus OS 3.70+** — compatible with read-only filesystem via `/data/` + rc.local
 
 ## 📋 Compatibility
@@ -94,9 +97,9 @@ data (see the Huawei note above).
 ### One-line install (recommended)
 ```bash
 wget -O /tmp/install.sh https://raw.githubusercontent.com/FoxTech-e-U/helios-ev/master/install.sh
-bash /tmp/install.sh ttyUSB1 2
+bash /tmp/install.sh ttyUSB0 2
 ```
-Arguments: `<serial device>` `<Modbus address>` (both optional, default `ttyUSB1` / `2`)
+Arguments: `<serial device>` `<Modbus address>` (both optional, default `ttyUSB0` / `2`)
 
 ### What the installer does
 1. Downloads `helios-abb-solar-charger.py` from GitHub (or uses local copy)
@@ -111,7 +114,7 @@ Arguments: `<serial device>` `<Modbus address>` (both optional, default `ttyUSB1
 ### Update to latest version
 ```bash
 wget -O /tmp/install.sh https://raw.githubusercontent.com/FoxTech-e-U/helios-ev/master/install.sh
-bash /tmp/install.sh ttyUSB1 2
+bash /tmp/install.sh ttyUSB0 2
 ```
 
 ## ⚙️ Configuration
@@ -119,7 +122,7 @@ bash /tmp/install.sh ttyUSB1 2
 Edit the top of `helios-abb-solar-charger.py` (or pass device/address to `install.sh`):
 
 ```python
-MODBUS_PORT    = '/dev/ttyUSB1'                          # RS485 adapter
+MODBUS_PORT    = '/dev/ttyUSB0'                           # RS485 adapter
 MODBUS_ADDRESS = 2                                        # ABB Terra address
 MIN_CURRENT    = 6                                        # A (IEC 61851 minimum)
 MAX_CURRENT    = 16                                       # A (your installation limit)
@@ -127,10 +130,17 @@ PHASES         = 3                                        # number of phases
 START_HYSTERESIS_S = 60                                   # seconds before starting
 STOP_HYSTERESIS_S  = 300                                  # seconds before stopping
 POLL_INTERVAL  = 10                                       # seconds
-GRID_SERVICE   = 'com.victronenergy.grid.cgwacs_ttyUSB0_mb1'  # your grid meter
+GRID_SERVICE   = 'com.victronenergy.system'               # real Multiplus AC-In grid power
+GRID_PATHS     = ['/Ac/Grid/L1/Power', '/Ac/Grid/L2/Power', '/Ac/Grid/L3/Power']
 ```
 
-To find your grid meter service:
+`GRID_SERVICE`/`GRID_PATHS` assume an ESS topology (Grid → Multiplus AC-In, house
+loads on AC-Out) with free feed-in allowed - a genuine PV surplus then shows up
+directly as grid export once the battery is full, no separate PV or battery
+reading needed.
+
+If you don't run an ESS/Multiplus setup, or have an export limit configured, point
+this at your own grid meter service instead:
 ```bash
 dbus -y | grep grid
 ```
@@ -147,16 +157,19 @@ surplus >= 4140W (6A×3ph) for 60s  → start charging
 surplus <  4140W for 300s          → pause (stop session)
 ```
 
-### Force Mode (RFID / App)
-- Triggered when charging starts externally (RFID, ABB app)
+### Force Mode (RFID / App / ChargerSync)
+- Triggered when charging starts externally (RFID, ABB app/ChargerSync)
 - Charges at `MAX_CURRENT` until vehicle unplugged or charging stopped externally
+- On daemon restart, an already-active session is **not** treated as an external
+  trigger - the daemon adopts it into PV_CHARGE at whatever surplus currently
+  allows, so a restart during normal PV charging never jumps to max current
 
-### Fully-charged vehicle
-If the vehicle reaches 100% while a charge session is active (state stays "EVSE
-ready" but no current is drawn despite sufficient surplus), the daemon attempts
-`start_charging()` exactly once, then waits quietly for a real state change
-(unplug/replug, or the vehicle drawing current again) instead of retrying every
-cycle.
+### Fully-charged / paused vehicle
+If the vehicle stops drawing current despite an active PV charge session (e.g. it
+reached 100%, or a brief comms hiccup happened), the daemon keeps sending a
+start command every cycle as long as surplus remains sufficient. This is
+idempotent and harmless, so there's no special-case bookkeeping and no risk of
+a session getting stuck waiting for a state change that never arrives.
 
 ### Charging State Reference
 | ABB State (register 0x400C, low byte) | Meaning |
@@ -182,6 +195,7 @@ Service: `com.victronenergy.evcharger.abb_terra_ac_2`
 | `/Status` | - | Raw charging state register |
 | `/ErrorCode` | - | Error code (0 = OK) |
 | `/Connected` | - | 1 if the last poll cycle read at least one register successfully |
+| `/Position` | - | 1 = AC Output (behind the Multiplus, in the house) |
 
 ## 🔧 Monitoring & Troubleshooting
 
@@ -205,7 +219,7 @@ are normal and self-recover. If this repeats continuously:
 1. Confirm nothing else is accessing this Modbus address — check for a
    `dbus-modbus-client` process still polling it:
    ```bash
-   dbus -y com.victronenergy.settings /Settings/ModbusClient/ttyUSB1/Devices GetValue
+   dbus -y com.victronenergy.settings /Settings/ModbusClient/ttyUSB0/Devices GetValue
    ```
    should NOT list your ABB's address.
 2. Check for unsolicited traffic on the bus from another device (see the Huawei
@@ -213,7 +227,7 @@ are normal and self-recover. If this repeats continuously:
    ```bash
    python3 -c "
    import serial, time
-   s = serial.Serial('/dev/ttyUSB1', baudrate=9600, bytesize=8, parity='N', stopbits=1, timeout=2)
+   s = serial.Serial('/dev/ttyUSB0', baudrate=9600, bytesize=8, parity='N', stopbits=1, timeout=2)
    print('Listening for 15s...')
    start = time.time(); data = b''
    while time.time() - start < 15:
@@ -223,6 +237,10 @@ are normal and self-recover. If this repeats continuously:
    s.close()"
    ```
    Any non-zero byte count here means something is transmitting unsolicited data.
+3. If you've re-wired or re-plugged RS485/USB adapters, double check that
+   `MODBUS_PORT` still points to the right `/dev/ttyUSBx` - USB serial devices can
+   re-enumerate to a different number when the set of connected adapters changes.
+   Using a persistent path from `ls /dev/serial/by-id/` avoids this entirely.
 
 ### ABB Terra not responding at all
 Power-cycle the wallbox (circuit breaker off, 10s, back on).
@@ -236,6 +254,15 @@ Power-cycle the wallbox (circuit breaker off, 10s, back on).
 The Cerbo GUI / VRM Portal can cache the old device state briefly when migrating
 from the `dbus-modbus-client` plugin. Toggling charging mode once in the ABB app,
 or a hard refresh of the VRM Portal page, typically resolves this immediately.
+
+### Dashboard shows the wallbox as "AC Input" instead of "AC Output"
+`/Position` is correctly set to `1` (AC Output) in the daemon, matching a wallbox
+installed behind the Multiplus (in the house, not on the raw grid connection). If
+the GUI still labels it "AC Input", this is the same GUI-caching behaviour as the
+"offline" issue above - a hard refresh of the Cerbo GUI / VRM page, or removing
+and re-adding the device from the Device List, resolves it. It's cosmetic and
+doesn't affect the PV surplus calculation, which reads grid power directly rather
+than relying on this field.
 
 ## 🤝 Contributing
 

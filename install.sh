@@ -20,7 +20,7 @@
 #   bash /tmp/install.sh [ttyUSBX] [modbus-address]
 #
 # Example:
-#   bash /tmp/install.sh ttyUSB1 2
+#   bash /tmp/install.sh ttyUSB0 2
 #
 
 set -e
@@ -47,7 +47,7 @@ print_header()  { echo ""; echo "========================================="; ech
 
 print_header "⚡ Helios EV Installation (exclusive RTU bus)"
 
-DEVICE="${1:-ttyUSB1}"
+DEVICE="${1:-ttyUSB0}"
 MODBUS_ADDR="${2:-2}"
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.1.0] - 2026-09-05
+### Changed
+- Grid-Messquelle auf `com.victronenergy.system` (/Ac/Grid/Lx/Power) umgestellt,
+  passend zur neuen Anlagentopologie (Grid → 3x Multiplus → Haus mit EVCS/WR)
+- Default RS485-Port auf `/dev/ttyUSB0` geändert (bisher ttyUSB1)
+
+### Fixed
+- Neustart-Bug: ein bereits laufender PV-Ladevorgang wurde nach einem
+  Daemon-Neustart fälschlich als externer Trigger erkannt und auf
+  MAX_CURRENT gezwungen. Der Daemon übernimmt jetzt beim Start den echten
+  ABB-Status und bleibt bei einer laufenden Session im PV_CHARGE-Modus.
+- "resume_sent"-Bug: eine Session konnte nach einem kurzen Kommunikations-
+  aussetzer oder bei vollem Fahrzeug dauerhaft hängen bleiben, weil der
+  Daemon nur einmal einen Neustartversuch unternahm. Er sendet jetzt bei
+  Bedarf jeden Zyklus erneut ein (idempotentes) Start-Kommando.
+
 ## v1.0.0 (2026-06-09)
 
 Initial release.

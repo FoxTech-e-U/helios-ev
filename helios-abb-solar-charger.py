@@ -3,46 +3,53 @@
 Helios ABB Terra AC Solar Charger Daemon
 =========================================
 
-Controls ABB Terra AC wallbox based on PV surplus from Victron system.
-Exclusively owns the RS485 bus for the ABB (address 2) - reads AND writes
-directly via Modbus, and publishes its own D-Bus service.
+Controls ABB Terra AC wallbox based on PV surplus from a Victron ESS system
+(3x Multiplus, AC-In = Grid, AC-Out = House). Exclusively owns the RS485 bus
+for the ABB (address 2) - reads AND writes directly via Modbus, and publishes
+its own D-Bus service.
 
 Why exclusive bus ownership:
-  Previously, dbus-modbus-client (reading the ABB) and this daemon (writing
-  SetCurrent/Start/Stop) both accessed the same RS485 bus independently.
-  RS485 is half-duplex; simultaneous access from two processes caused
-  collisions, corrupted reads, and repeated dbus-modbus-client crashes/
-  restarts (visible as "Device failed: Error reading registers 0x4006-0x4009"
-  in its logs, and "Could not read ABB status from D-Bus" here).
-  A comparable Victron smartmeter on its own dedicated RS485 bus runs
-  reliably - confirming the bus itself is fine, only concurrent access is
-  the problem. This daemon now owns ttyUSB1 address 2 exclusively: it is
-  the ONLY process reading or writing the ABB. dbus-modbus-client must be
-  configured to ignore address 2 (see install.sh).
+  RS485 is half-duplex. Two independent processes accessing the same address
+  caused collisions, corrupted reads, and repeated dbus-modbus-client crashes.
+  This daemon is the ONLY process reading or writing the ABB's address.
+  dbus-modbus-client is configured to ignore it (see install.sh).
+
+Surplus source (changed in this version):
+  Grid power now comes from com.victronenergy.system (/Ac/Grid/Lx/Power),
+  which reflects the real import/export at the Multiplus AC-In - i.e. after
+  the ESS has already prioritised charging the battery. As long as free
+  feed-in is allowed (no export limit configured), a genuine PV surplus
+  shows up directly as grid export, with no need to read PV or battery
+  values separately.
+
+  surplus_w = -(grid_L1 + grid_L2 + grid_L3) + charging_w
+  charge_a  = clamp(surplus_w / 230V / phases, MIN_CURRENT, MAX_CURRENT)
 
 Modes:
   IDLE        - No vehicle connected (State A)
   PV_WAIT     - Vehicle connected, waiting for PV surplus (hysteresis)
   PV_CHARGE   - Charging with PV surplus (6-16A dynamic)
-  FORCE       - Force charging at max current (triggered by RFID/App/external)
-
-PV Surplus logic:
-  surplus_w = -(grid_L1 + grid_L2 + grid_L3) + charging_w
-  charge_a  = surplus_w / 230 / 3               # 3-phase
-  charge_a  = clamp(MIN_CURRENT, MAX_CURRENT)
-  If charge_a < MIN_CURRENT for STOP_HYSTERESIS_S  → pause (stop session)
-  If charge_a >= MIN_CURRENT for START_HYSTERESIS_S → start/resume
+  FORCE       - Force charging at max current (triggered by RFID/App/ChargerSync)
 
 Force mode:
-  Triggered when charging starts externally (RFID tap, ABB app, etc.)
-  Detected: State transitions to CHARGING but daemon did not initiate it
-  Ends when vehicle is disconnected
+  Triggered when charging starts externally (RFID tap, ABB app/ChargerSync).
+  Detected: state transitions to CHARGING but the daemon did not initiate it.
+  Ends when the vehicle is disconnected.
 
-Fully-charged vehicle handling:
-  If the vehicle stops drawing current despite an active charge session
-  (state B2, ready, but 0A actually flowing - e.g. vehicle reached 100%),
-  the daemon attempts start_charging() exactly once, then waits quietly
-  for a real state change instead of retrying every cycle.
+Bugfixes in this version (vs. the RTU-exclusive baseline):
+  1. Restart no longer forces max current. Previously, restarting the daemon
+     while a PV-managed session was already active made it look identical to
+     an externally-triggered charge (daemon_started_charging defaults False
+     on a fresh instance), so it jumped straight to FORCE/MAX_CURRENT. Now
+     the daemon reads the ABB's real state once at startup and adopts
+     PV_CHARGE directly if it's already charging, instead of guessing.
+  2. Removed the one-shot "resume_sent" flag. It was meant to avoid retrying
+     start_charging() every cycle once a fully-charged vehicle stopped
+     drawing current, but could leave a session stuck waiting for a state
+     change that never came (e.g. after a brief comms hiccup). The daemon
+     now simply re-sends start_charging() every cycle while surplus is
+     sufficient but the ABB isn't reporting STATE_CHARGING - the command is
+     idempotent, so this is harmless.
 
 Author: FoxTech e.U.
 Repository: https://github.com/FoxTech-e-U/helios-ev
@@ -71,7 +78,7 @@ from gi.repository import GLib
 # =============================================================================
 
 # RS485 device and Modbus address
-MODBUS_PORT    = '/dev/ttyUSB1'
+MODBUS_PORT    = '/dev/ttyUSB0'
 MODBUS_ADDRESS = 2          # ABB Terra AC default address
 MODBUS_BAUD    = 9600
 
@@ -88,8 +95,11 @@ START_HYSTERESIS_S = 60     # seconds surplus must be stable before starting
 STOP_HYSTERESIS_S  = 300    # seconds surplus must be below minimum before pausing
 MODBUS_TIMEOUT_S   = 120    # seconds - write to 0x4106 to keep ABB alive
 
-# Victron D-Bus
-GRID_SERVICE     = 'com.victronenergy.grid.cgwacs_ttyUSB0_mb1'
+# Grid power: real import/export at the Multiplus AC-In, post battery-
+# priority. Negative = export = genuine surplus (requires free feed-in).
+GRID_SERVICE = 'com.victronenergy.system'
+GRID_PATHS   = ['/Ac/Grid/L1/Power', '/Ac/Grid/L2/Power', '/Ac/Grid/L3/Power']
+
 DEVICE_INSTANCE  = 40
 
 # Logging
@@ -174,8 +184,8 @@ def dbus_get(service, path):
 def get_grid_power():
     """Return total grid power in W. Negative = export (surplus)."""
     total = 0.0
-    for phase in ['L1', 'L2', 'L3']:
-        p = dbus_get(GRID_SERVICE, f'/Ac/{phase}/Power')
+    for path in GRID_PATHS:
+        p = dbus_get(GRID_SERVICE, path)
         if p is None:
             return None
         total += p
@@ -254,11 +264,10 @@ def i32(val):
 class SolarCharger:
     def __init__(self):
         self.mode = Mode.IDLE
+        self.initialized = False              # becomes True after first ABB read
         self.surplus_above_min_since = None   # timestamp when surplus exceeded min
         self.surplus_below_min_since = None   # timestamp when surplus dropped below min
         self.daemon_started_charging = False  # True if we sent the start command
-        self.resume_sent = False              # True once we tried start_charging(), waiting for state change
-        self.last_seen_state = None           # last observed charging state, to detect real changes
         self.last_keepalive = time.time()
         self.running = True
 
@@ -277,7 +286,7 @@ class SolarCharger:
         svc = VeDbusService('com.victronenergy.evcharger.abb_terra_ac_2', register=False)
 
         svc.add_path('/Mgmt/ProcessName', __file__)
-        svc.add_path('/Mgmt/ProcessVersion', '3.0-exclusive-rtu')
+        svc.add_path('/Mgmt/ProcessVersion', '2.1.0-exclusive-rtu')
         svc.add_path('/Mgmt/Connection', f'Modbus RTU {MODBUS_PORT}:{MODBUS_ADDRESS}')
         svc.add_path('/DeviceInstance', DEVICE_INSTANCE)
         svc.add_path('/ProductId', 0xB044)
@@ -286,7 +295,7 @@ class SolarCharger:
         svc.add_path('/Connected', 0)
         svc.add_path('/AllowedRoles', ['evcharger'])
         svc.add_path('/Role', 'evcharger')
-        svc.add_path('/Position', 1)  # AC output
+        svc.add_path('/Position', 1)  # AC output (behind the Multiplus, in the house)
         svc.add_path('/NrOfPhases', 3)
 
         svc.add_path('/MaxCurrent', None, gettextcallback=lambda p, v: f"{v:.1f} A" if v is not None else None)
@@ -424,6 +433,7 @@ class SolarCharger:
         log.info("Helios ABB Terra AC Solar Charger Daemon starting")
         log.info(f"  Min current:  {MIN_CURRENT}A ({MIN_POWER_W:.0f}W)")
         log.info(f"  Max current:  {MAX_CURRENT}A ({MAX_CURRENT*PHASES*VOLTAGE:.0f}W)")
+        log.info(f"  Grid source:  {GRID_SERVICE} {GRID_PATHS}")
         log.info(f"  Start hysteresis: {START_HYSTERESIS_S}s")
         log.info(f"  Stop hysteresis:  {STOP_HYSTERESIS_S}s")
         log.info(f"  Poll interval:{POLL_INTERVAL}s")
@@ -480,6 +490,23 @@ class SolarCharger:
             log.warning("Could not read ABB status via Modbus")
             return
 
+        # --- Startup safety (bugfix): adopt the ABB's real state instead of
+        #     assuming a fresh IDLE/disconnected start. Without this, a
+        #     daemon restart during an already-active PV session looked
+        #     identical to an externally-triggered charge (see FORCE
+        #     detection below) and jumped straight to MAX_CURRENT. ---
+        if not self.initialized:
+            self.initialized = True
+            if state == STATE_CHARGING:
+                log.info("Startup: ABB already charging → resuming PV_CHARGE "
+                         "management (not forcing max current)")
+                self.mode = Mode.PV_CHARGE
+                self.daemon_started_charging = True
+            elif state in (STATE_EV_PLUGGED_AUTH, STATE_EV_PLUGGED_READY, STATE_EV_READY):
+                self.mode = Mode.PV_WAIT
+            else:
+                self.mode = Mode.IDLE
+
         grid_w = get_grid_power()
         if grid_w is None:
             log.warning("Could not read grid power from D-Bus")
@@ -511,7 +538,7 @@ class SolarCharger:
 
         # Vehicle is connected (state >= 1) ─────────────────────────────────
 
-        # Detect externally triggered charging (RFID / App)
+        # Detect externally triggered charging (RFID / App / ChargerSync)
         if state == STATE_CHARGING and not self.daemon_started_charging:
             if self.mode not in (Mode.FORCE,):
                 log.info("External charge trigger detected (RFID/App) → FORCE mode")
@@ -551,8 +578,6 @@ class SolarCharger:
                     start_charging(client)
                     self.daemon_started_charging = True
                     self.mode = Mode.PV_CHARGE
-                    self.resume_sent = True  # we just sent start_charging() above
-                    self.last_seen_state = state
                     self.surplus_below_min_since = None
             else:
                 if self.surplus_above_min_since is not None:
@@ -560,24 +585,17 @@ class SolarCharger:
                 self.surplus_above_min_since = None
 
         elif self.mode == Mode.PV_CHARGE:
-            # Detect a real state change (vehicle starts drawing current,
-            # or gets unplugged/replugged) - this re-arms resume attempts.
-            if state != self.last_seen_state:
-                self.resume_sent = False
-                self.last_seen_state = state
-
             if target_a >= MIN_CURRENT:
                 self.surplus_below_min_since = None
                 current_a = self.service['/Current'] or 0
-                if current_a == 0:
-                    if not self.resume_sent:
-                        log.info(f"Resuming charge at {target_a:.1f}A (surplus {surplus_w:.0f}W)")
-                        set_current(client, target_a)
-                        start_charging(client)
-                        self.resume_sent = True
-                    else:
-                        log.debug(f"Waiting for vehicle (state={state}, no current drawn, "
-                                  f"already attempted resume)")
+                if current_a == 0 or state != STATE_CHARGING:
+                    # Not actually charging right now (paused, fully charged,
+                    # or a brief comms hiccup) but surplus is sufficient -
+                    # keep nudging. Idempotent, so no "already tried once"
+                    # bookkeeping is needed (that was the v2.0.1 bug).
+                    log.info(f"Nudging charge start at {target_a:.1f}A (surplus {surplus_w:.0f}W)")
+                    set_current(client, target_a)
+                    start_charging(client)
                 elif abs(target_a - current_a) > 0.5:
                     log.info(f"Adjusting charge current: {current_a:.1f}A → {target_a:.1f}A "
                              f"(surplus {surplus_w:.0f}W)")
