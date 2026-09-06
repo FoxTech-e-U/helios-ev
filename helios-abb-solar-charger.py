@@ -40,26 +40,33 @@ Force mode and the battery-drain problem:
   As long as the wallbox sits on the Multiplus AC-Out (house) side, a forced
   full-power charge (11kW at 16A) draws from wherever the ESS decides -
   normally the battery first, only falling back to the grid once the battery
-  can't supply it. That's fine for the house's normal background load, but
-  actively harmful for an EV charge session, so FORCE temporarily switches
-  the ESS Battery-Life state to "Keep batteries charged" for the duration of
-  the session (this sources everything from the grid instead), and restores
-  the previous state when the session ends. Once the wallbox is moved to the
-  grid side of the installation (planned), the battery becomes physically
-  unreachable from the wallbox and this workaround can be removed - FORCE can
-  then simply set MAX_CURRENT again.
+  can't supply it.
 
-  BATTERY_LIFE_KEEP_CHARGED must be filled in before this is active (see
-  README) - the exact value for "Keep batteries charged" is firmware/
-  installation-specific. Until it is set, FORCE behaves as before (no
-  Battery-Life switching) - fill it in as soon as you know it.
+  IMPORTANT: an earlier version of this daemon tried to work around this by
+  temporarily switching the ESS Battery-Life state to "Keep batteries
+  charged" during FORCE. This was WRONG and has been reverted - that mode
+  does not merely avoid discharging the battery, it actively CHARGES it from
+  the grid up to 100% (a backup-reserve feature, not a "serve this load from
+  grid" switch). In testing this caused exactly the opposite of what was
+  intended: unwanted grid-charging cycles instead of just protecting the
+  battery from the wallbox load.
 
-  A small marker file (BATTERY_LIFE_STATE_FILE) records the previous
-  Battery-Life value while it's overridden. If the daemon crashes or is
-  restarted mid-FORCE-session before it could restore that value, the ESS
-  would otherwise stay stuck in "Keep batteries charged" indefinitely. On
-  every startup, the daemon checks for this marker and restores the saved
-  value immediately if found.
+  No verified, safe Victron ESS setting currently exists in this project to
+  cleanly say "serve this one load from the grid, don't touch the battery,
+  and don't actively charge it either" - Victron's Battery-Life states are
+  coarse-grained system-wide modes, not per-load overrides. Until a proper
+  mechanism is found and tested, FORCE simply draws from wherever the ESS
+  puts it (usually the battery) - this is unwanted but at least
+  predictable and not actively harmful the way the grid-charging mistake was.
+
+  The real, reliable fix being planned is moving the wallbox to the grid
+  side of the installation (ahead of the Multiplus AC-In) - once done, the
+  battery becomes physically unreachable from the wallbox and none of this
+  matters anymore. BATTERY_LIFE_KEEP_CHARGED stays here only as a documented
+  dead end - do not re-enable it without first verifying an alternative
+  approach against a real ESS setpoint mechanism (e.g. an external AC power
+  setpoint / zero-feed-in style control loop), tested carefully on a system
+  that isn't relied upon, before touching this installation's battery again.
 
 Bugfixes vs. the earlier RTU-exclusive baseline:
   1. Restart no longer forces max current. Previously, restarting the daemon
@@ -132,7 +139,12 @@ GRID_PATHS   = ['/Ac/Grid/L1/Power', '/Ac/Grid/L2/Power', '/Ac/Grid/L3/Power']
 # after manually setting "Keep batteries charged" in Remote Console once.
 BATTERY_LIFE_SERVICE      = 'com.victronenergy.settings'
 BATTERY_LIFE_PATH         = '/Settings/CGwacs/BatteryLife/State'
-BATTERY_LIFE_KEEP_CHARGED = 9      # "Keep batteries charged" (ermittelt: vorher 10, danach 9)
+BATTERY_LIFE_KEEP_CHARGED = None   # DISABLED - see docstring: "Keep batteries
+                                    # charged" actively charges from the grid
+                                    # up to 100%, it does not merely avoid
+                                    # discharge. Not suitable for this use
+                                    # case. Do not re-enable without a
+                                    # verified alternative (see docstring).
 
 # Marker file to survive a crash/restart mid-FORCE-session without leaving
 # the ESS stuck in "Keep batteries charged" forever.
@@ -414,7 +426,7 @@ class SolarCharger:
         svc = VeDbusService('com.victronenergy.evcharger.abb_terra_ac_2', register=False)
 
         svc.add_path('/Mgmt/ProcessName', __file__)
-        svc.add_path('/Mgmt/ProcessVersion', '2.3.0-exclusive-rtu')
+        svc.add_path('/Mgmt/ProcessVersion', '2.3.1-exclusive-rtu')
         svc.add_path('/Mgmt/Connection', f'Modbus RTU {MODBUS_PORT}:{MODBUS_ADDRESS}')
         svc.add_path('/DeviceInstance', DEVICE_INSTANCE)
         svc.add_path('/ProductId', 0xB044)
