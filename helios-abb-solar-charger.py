@@ -272,6 +272,18 @@ def clear_battery_life_marker():
 # =============================================================================
 # Modbus helpers (exclusive bus access)
 # =============================================================================
+def _flush_serial(client):
+    """Actively clear the serial buffers before a transaction. Without this,
+    leftover garbage bytes from a failed transfer can corrupt the *next*
+    transaction too (seen in logs as "Cleanup recv buffer before send") -
+    one bad read cascading into several more."""
+    try:
+        if client.socket:
+            client.socket.reset_input_buffer()
+            client.socket.reset_output_buffer()
+    except Exception:
+        pass
+
 def read_u32(client, reg, retries=5):
     """Read a 32-bit unsigned register (2x16bit big-endian). Retries on
     failure with increasing backoff - failures appear to come in short
@@ -280,6 +292,7 @@ def read_u32(client, reg, retries=5):
     for attempt in range(retries):
         if attempt > 0:
             time.sleep(0.3 * attempt)  # 0.3, 0.6, 0.9, 1.2s - spans a longer window
+        _flush_serial(client)
         r = client.read_holding_registers(reg, 2, unit=MODBUS_ADDRESS)
         if hasattr(r, 'registers') and len(r.registers) == 2:
             return (r.registers[0] << 16) | r.registers[1]
@@ -292,6 +305,7 @@ def write_u32(client, reg, value, retries=3):
     for attempt in range(retries):
         if attempt > 0:
             time.sleep(0.5)
+        _flush_serial(client)
         r = client.write_registers(reg, [hi, lo], unit=MODBUS_ADDRESS)
         if hasattr(r, 'isError') and not r.isError():
             return True
@@ -304,6 +318,7 @@ def write_u16(client, reg, value, retries=3):
     for attempt in range(retries):
         if attempt > 0:
             time.sleep(0.5)
+        _flush_serial(client)
         r = client.write_register(reg, value, unit=MODBUS_ADDRESS)
         if hasattr(r, 'isError') and not r.isError():
             return True
@@ -399,7 +414,7 @@ class SolarCharger:
         svc = VeDbusService('com.victronenergy.evcharger.abb_terra_ac_2', register=False)
 
         svc.add_path('/Mgmt/ProcessName', __file__)
-        svc.add_path('/Mgmt/ProcessVersion', '2.2.1-exclusive-rtu')
+        svc.add_path('/Mgmt/ProcessVersion', '2.3.0-exclusive-rtu')
         svc.add_path('/Mgmt/Connection', f'Modbus RTU {MODBUS_PORT}:{MODBUS_ADDRESS}')
         svc.add_path('/DeviceInstance', DEVICE_INSTANCE)
         svc.add_path('/ProductId', 0xB044)

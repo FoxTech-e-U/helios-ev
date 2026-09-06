@@ -101,6 +101,46 @@ print_success "dbus-modbus-client Devices for $DEVICE: '$NEW_DEVICES' (address $
 svc -t /service/dbus-modbus-client.serial.${DEVICE} 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
+# Step 3b: Exclude the WHOLE PORT from serial-starter, not just this address
+# ---------------------------------------------------------------------------
+print_header "Step 3b: Exclude $DEVICE from serial-starter entirely"
+
+print_info "Excluding one address from dbus-modbus-client is not enough - Venus OS's"
+print_info "serial-starter also spins up other device-probe services on this same port"
+print_info "(dbus-cgwacs, dbus-fzsonick-48tl, dbus-imt-si-rs485tc, etc.), and any of"
+print_info "them can collide with our exclusive Modbus access, even if never configured."
+
+# Immediate effect (does not survive reboot/replug on its own)
+/opt/victronenergy/serial-starter/stop-tty.sh ${DEVICE} 2>/dev/null || true
+
+# Permanent effect via udev, scoped to this physical USB port (not the chip
+# model) so a different adapter type on another port - e.g. a grid meter
+# added later - is not accidentally excluded too.
+REPLY=$(udevadm info --query=property --name=/dev/${DEVICE} 2>/dev/null || echo "")
+PATH_TAG=$(echo "$REPLY" | sed -n 's/^ID_PATH_TAG=//p')
+
+if [ -n "$PATH_TAG" ]; then
+    RULES_FILE="/etc/udev/rules.d/serial-starter.rules"
+    if [ -f "$RULES_FILE" ] && grep -qF "$PATH_TAG" "$RULES_FILE" 2>/dev/null; then
+        print_info "udev rule for this USB path already present in $RULES_FILE"
+    else
+        mount -o remount,rw /
+        {
+            echo ""
+            echo "# Helios EV: exclude $DEVICE (ABB Terra, USB path $PATH_TAG) from serial-starter"
+            echo "ACTION==\"add\", ENV{ID_BUS}==\"usb\", ENV{ID_PATH_TAG}==\"${PATH_TAG}\", ENV{VE_SERVICE}=\"ignore\""
+        } >> "$RULES_FILE"
+        mount -o remount,ro /
+        print_success "Permanent udev rule added (scoped to USB path $PATH_TAG)"
+        print_warning "A REBOOT is required for this udev rule to take full effect"
+    fi
+else
+    print_warning "Could not determine ID_PATH_TAG for $DEVICE - permanent serial-starter"
+    print_warning "exclusion was skipped. stop-tty.sh above still applies until next reboot/replug."
+    print_warning "You can add the udev rule manually - see the README troubleshooting section."
+fi
+
+# ---------------------------------------------------------------------------
 # Step 4: Install daemon
 # ---------------------------------------------------------------------------
 print_header "Step 4: Install Daemon"
@@ -171,6 +211,9 @@ if ! grep -q "$RC_MARKER" "$RC_LOCAL" 2>/dev/null; then
 $RC_MARKER
 # Ensure dbus-modbus-client never re-acquires the ABB address after an update
 dbus -y com.victronenergy.settings /Settings/ModbusClient/${DEVICE}/Devices SetValue "$NEW_DEVICES" 2>/dev/null || true
+# Belt-and-suspenders: also tell serial-starter to leave this port alone,
+# in case the udev rule didn't survive a firmware update
+/opt/victronenergy/serial-starter/stop-tty.sh ${DEVICE} 2>/dev/null || true
 if [ ! -f $SERVICE_DIR/run ]; then
     mkdir -p $SERVICE_DIR/log
     cp $DAEMON_DIR/service/helios-abb-solar-charger/run $SERVICE_DIR/
