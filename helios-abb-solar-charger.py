@@ -272,13 +272,14 @@ def clear_battery_life_marker():
 # =============================================================================
 # Modbus helpers (exclusive bus access)
 # =============================================================================
-def read_u32(client, reg, retries=3):
+def read_u32(client, reg, retries=5):
     """Read a 32-bit unsigned register (2x16bit big-endian). Retries on
-    failure - the bus has an observed ~20-25% per-transaction error rate,
-    so a bare single attempt made the daemon miss reads far too often."""
+    failure with increasing backoff - failures appear to come in short
+    noise bursts rather than independent random packet loss, so a wider
+    retry window (not just more attempts close together) matters here."""
     for attempt in range(retries):
         if attempt > 0:
-            time.sleep(0.3)
+            time.sleep(0.3 * attempt)  # 0.3, 0.6, 0.9, 1.2s - spans a longer window
         r = client.read_holding_registers(reg, 2, unit=MODBUS_ADDRESS)
         if hasattr(r, 'registers') and len(r.registers) == 2:
             return (r.registers[0] << 16) | r.registers[1]
