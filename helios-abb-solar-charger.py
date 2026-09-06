@@ -4,9 +4,10 @@ Helios ABB Terra AC Solar Charger Daemon
 =========================================
 
 Controls ABB Terra AC wallbox based on PV surplus from a Victron ESS system
-(3x Multiplus, AC-In = Grid, AC-Out = House). Exclusively owns the RS485 bus
-for the ABB (address 2) - reads AND writes directly via Modbus, and publishes
-its own D-Bus service.
+(3x Multiplus, AC-In = Grid, AC-Out = House; wallbox currently on the house/
+AC-Out side - see FORCE mode note below). Exclusively owns the RS485 bus for
+the ABB (address 2) - reads AND writes directly via Modbus, and publishes its
+own D-Bus service.
 
 Why exclusive bus ownership:
   RS485 is half-duplex. Two independent processes accessing the same address
@@ -14,16 +15,20 @@ Why exclusive bus ownership:
   This daemon is the ONLY process reading or writing the ABB's address.
   dbus-modbus-client is configured to ignore it (see install.sh).
 
-Surplus source (changed in this version):
-  Grid power now comes from com.victronenergy.system (/Ac/Grid/Lx/Power),
-  which reflects the real import/export at the Multiplus AC-In - i.e. after
-  the ESS has already prioritised charging the battery. As long as free
-  feed-in is allowed (no export limit configured), a genuine PV surplus
-  shows up directly as grid export, with no need to read PV or battery
-  values separately.
+Surplus source:
+  Grid power comes from com.victronenergy.system (/Ac/Grid/Lx/Power), which
+  reflects the real import/export at the Multiplus AC-In - i.e. after the ESS
+  has already prioritised charging the battery. As long as free feed-in is
+  allowed (no export limit configured), a genuine PV surplus shows up
+  directly as grid export once the battery is full, with no need to read PV
+  or battery values separately.
 
   surplus_w = -(grid_L1 + grid_L2 + grid_L3) + charging_w
   charge_a  = clamp(surplus_w / 230V / phases, MIN_CURRENT, MAX_CURRENT)
+
+  This is inherently battery-safe: it only ever commands a current once the
+  battery is already full and the extra is otherwise being exported. No
+  special handling needed here.
 
 Modes:
   IDLE        - No vehicle connected (State A)
@@ -31,12 +36,32 @@ Modes:
   PV_CHARGE   - Charging with PV surplus (6-16A dynamic)
   FORCE       - Force charging at max current (triggered by RFID/App/ChargerSync)
 
-Force mode:
-  Triggered when charging starts externally (RFID tap, ABB app/ChargerSync).
-  Detected: state transitions to CHARGING but the daemon did not initiate it.
-  Ends when the vehicle is disconnected.
+Force mode and the battery-drain problem:
+  As long as the wallbox sits on the Multiplus AC-Out (house) side, a forced
+  full-power charge (11kW at 16A) draws from wherever the ESS decides -
+  normally the battery first, only falling back to the grid once the battery
+  can't supply it. That's fine for the house's normal background load, but
+  actively harmful for an EV charge session, so FORCE temporarily switches
+  the ESS Battery-Life state to "Keep batteries charged" for the duration of
+  the session (this sources everything from the grid instead), and restores
+  the previous state when the session ends. Once the wallbox is moved to the
+  grid side of the installation (planned), the battery becomes physically
+  unreachable from the wallbox and this workaround can be removed - FORCE can
+  then simply set MAX_CURRENT again.
 
-Bugfixes in this version (vs. the RTU-exclusive baseline):
+  BATTERY_LIFE_KEEP_CHARGED must be filled in before this is active (see
+  README) - the exact value for "Keep batteries charged" is firmware/
+  installation-specific. Until it is set, FORCE behaves as before (no
+  Battery-Life switching) - fill it in as soon as you know it.
+
+  A small marker file (BATTERY_LIFE_STATE_FILE) records the previous
+  Battery-Life value while it's overridden. If the daemon crashes or is
+  restarted mid-FORCE-session before it could restore that value, the ESS
+  would otherwise stay stuck in "Keep batteries charged" indefinitely. On
+  every startup, the daemon checks for this marker and restores the saved
+  value immediately if found.
+
+Bugfixes vs. the earlier RTU-exclusive baseline:
   1. Restart no longer forces max current. Previously, restarting the daemon
      while a PV-managed session was already active made it look identical to
      an externally-triggered charge (daemon_started_charging defaults False
@@ -62,6 +87,7 @@ import time
 import logging
 import signal
 import threading
+import subprocess
 from enum import Enum
 from pymodbus.client.sync import ModbusSerialClient
 
@@ -99,6 +125,18 @@ MODBUS_TIMEOUT_S   = 120    # seconds - write to 0x4106 to keep ABB alive
 # priority. Negative = export = genuine surplus (requires free feed-in).
 GRID_SERVICE = 'com.victronenergy.system'
 GRID_PATHS   = ['/Ac/Grid/L1/Power', '/Ac/Grid/L2/Power', '/Ac/Grid/L3/Power']
+
+# ESS Battery-Life override used during FORCE mode (see docstring above).
+# Fill in once known: dbus -y com.victronenergy.settings
+#   /Settings/CGwacs/BatteryLife/State GetValue
+# after manually setting "Keep batteries charged" in Remote Console once.
+BATTERY_LIFE_SERVICE      = 'com.victronenergy.settings'
+BATTERY_LIFE_PATH         = '/Settings/CGwacs/BatteryLife/State'
+BATTERY_LIFE_KEEP_CHARGED = 9      # "Keep batteries charged" (ermittelt: vorher 10, danach 9)
+
+# Marker file to survive a crash/restart mid-FORCE-session without leaving
+# the ESS stuck in "Keep batteries charged" forever.
+BATTERY_LIFE_STATE_FILE = '/data/helios-abb-terra-ac/.battery_life_saved'
 
 DEVICE_INSTANCE  = 40
 
@@ -161,10 +199,9 @@ def setup_logging():
 log = logging.getLogger(__name__)
 
 # =============================================================================
-# D-Bus helper for reading OTHER services (grid meter) - still via CLI,
-# since that's a separate service we don't own.
+# D-Bus helpers for reading/writing OTHER services - via CLI, since those
+# are separate services we don't own.
 # =============================================================================
-import subprocess
 DBUS_CMD = 'dbus'
 
 def dbus_get(service, path):
@@ -181,6 +218,18 @@ def dbus_get(service, path):
         log.debug(f"dbus_get {service} {path}: {e}")
     return None
 
+def dbus_set(service, path, value):
+    """Write a D-Bus value via CLI. Returns True on success."""
+    try:
+        result = subprocess.run(
+            [DBUS_CMD, '-y', service, path, 'SetValue', str(value)],
+            capture_output=True, text=True, timeout=5
+        )
+        return result.returncode == 0
+    except Exception as e:
+        log.debug(f"dbus_set {service} {path}: {e}")
+        return False
+
 def get_grid_power():
     """Return total grid power in W. Negative = export (surplus)."""
     total = 0.0
@@ -192,13 +241,47 @@ def get_grid_power():
     return total
 
 # =============================================================================
+# Battery-Life override persistence (survives a crash mid-FORCE-session)
+# =============================================================================
+def save_battery_life_marker(value):
+    try:
+        os.makedirs(os.path.dirname(BATTERY_LIFE_STATE_FILE), exist_ok=True)
+        with open(BATTERY_LIFE_STATE_FILE, 'w') as f:
+            f.write(str(value))
+    except Exception as e:
+        log.warning(f"Could not write Battery-Life marker file: {e}")
+
+def load_battery_life_marker():
+    try:
+        with open(BATTERY_LIFE_STATE_FILE) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        log.warning(f"Could not read Battery-Life marker file: {e}")
+        return None
+
+def clear_battery_life_marker():
+    try:
+        os.remove(BATTERY_LIFE_STATE_FILE)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning(f"Could not remove Battery-Life marker file: {e}")
+
+# =============================================================================
 # Modbus helpers (exclusive bus access)
 # =============================================================================
-def read_u32(client, reg):
-    """Read a 32-bit unsigned register (2x16bit big-endian)."""
-    r = client.read_holding_registers(reg, 2, unit=MODBUS_ADDRESS)
-    if hasattr(r, 'registers') and len(r.registers) == 2:
-        return (r.registers[0] << 16) | r.registers[1]
+def read_u32(client, reg, retries=3):
+    """Read a 32-bit unsigned register (2x16bit big-endian). Retries on
+    failure - the bus has an observed ~20-25% per-transaction error rate,
+    so a bare single attempt made the daemon miss reads far too often."""
+    for attempt in range(retries):
+        if attempt > 0:
+            time.sleep(0.3)
+        r = client.read_holding_registers(reg, 2, unit=MODBUS_ADDRESS)
+        if hasattr(r, 'registers') and len(r.registers) == 2:
+            return (r.registers[0] << 16) | r.registers[1]
     return None
 
 def write_u32(client, reg, value, retries=3):
@@ -268,6 +351,7 @@ class SolarCharger:
         self.surplus_above_min_since = None   # timestamp when surplus exceeded min
         self.surplus_below_min_since = None   # timestamp when surplus dropped below min
         self.daemon_started_charging = False  # True if we sent the start command
+        self.saved_battery_life_state = None  # previous Battery-Life value, while FORCE overrides it
         self.last_keepalive = time.time()
         self.running = True
 
@@ -282,11 +366,39 @@ class SolarCharger:
         self.running = False
         self.mainloop.quit()
 
+    def _enter_force_battery_override(self):
+        """Switch ESS Battery-Life to 'Keep charged' for the FORCE session,
+        remembering the previous value so it can be restored afterwards."""
+        if BATTERY_LIFE_KEEP_CHARGED is None:
+            log.debug("BATTERY_LIFE_KEEP_CHARGED not configured - FORCE will not "
+                      "override Battery-Life (may draw from the battery)")
+            return
+        if self.saved_battery_life_state is not None:
+            return  # already overridden
+        current_state = dbus_get(BATTERY_LIFE_SERVICE, BATTERY_LIFE_PATH)
+        if current_state is None:
+            log.warning("Could not read current Battery-Life state - not overriding")
+            return
+        self.saved_battery_life_state = current_state
+        save_battery_life_marker(current_state)
+        dbus_set(BATTERY_LIFE_SERVICE, BATTERY_LIFE_PATH, BATTERY_LIFE_KEEP_CHARGED)
+        log.info(f"FORCE: Battery-Life → 'Keep charged' (was {current_state}) "
+                 f"- forced charge will draw from grid, not battery")
+
+    def _exit_force_battery_override(self):
+        """Restore the Battery-Life value saved before FORCE started."""
+        if self.saved_battery_life_state is None:
+            return
+        dbus_set(BATTERY_LIFE_SERVICE, BATTERY_LIFE_PATH, self.saved_battery_life_state)
+        log.info(f"FORCE ended: Battery-Life restored to {self.saved_battery_life_state}")
+        self.saved_battery_life_state = None
+        clear_battery_life_marker()
+
     def _create_service(self):
         svc = VeDbusService('com.victronenergy.evcharger.abb_terra_ac_2', register=False)
 
         svc.add_path('/Mgmt/ProcessName', __file__)
-        svc.add_path('/Mgmt/ProcessVersion', '2.1.0-exclusive-rtu')
+        svc.add_path('/Mgmt/ProcessVersion', '2.2.0-exclusive-rtu')
         svc.add_path('/Mgmt/Connection', f'Modbus RTU {MODBUS_PORT}:{MODBUS_ADDRESS}')
         svc.add_path('/DeviceInstance', DEVICE_INSTANCE)
         svc.add_path('/ProductId', 0xB044)
@@ -440,6 +552,17 @@ class SolarCharger:
         log.info("  Bus mode: EXCLUSIVE (dbus-modbus-client must ignore this address)")
         log.info("=" * 60)
 
+        # --- Crash recovery: if a marker is present, a previous instance
+        #     switched Battery-Life to "Keep charged" for FORCE and never
+        #     got to restore it (crash / hard restart). Fix that now,
+        #     before anything else. ---
+        marker = load_battery_life_marker()
+        if marker is not None:
+            log.warning(f"Found leftover Battery-Life marker ({marker}) from an "
+                        f"unclean shutdown during FORCE - restoring it now")
+            dbus_set(BATTERY_LIFE_SERVICE, BATTERY_LIFE_PATH, marker)
+            clear_battery_life_marker()
+
         client = None
         while self.running:
             try:
@@ -530,6 +653,8 @@ class SolarCharger:
         if state == STATE_IDLE:
             if self.mode != Mode.IDLE:
                 log.info("Vehicle disconnected → IDLE")
+                if self.mode == Mode.FORCE:
+                    self._exit_force_battery_override()
                 self.mode = Mode.IDLE
                 self.daemon_started_charging = False
                 self.surplus_above_min_since = None
@@ -541,15 +666,17 @@ class SolarCharger:
         # Detect externally triggered charging (RFID / App / ChargerSync)
         if state == STATE_CHARGING and not self.daemon_started_charging:
             if self.mode not in (Mode.FORCE,):
-                log.info("External charge trigger detected (RFID/App) → FORCE mode")
+                log.info("External charge trigger detected (RFID/App/ChargerSync) → FORCE mode")
                 self.mode = Mode.FORCE
+                self._enter_force_battery_override()
                 set_current(client, MAX_CURRENT)
                 return
 
-        # FORCE mode: full speed until vehicle unplugged
+        # FORCE mode: full speed until vehicle unplugged or stopped externally
         if self.mode == Mode.FORCE:
             if state != STATE_CHARGING:
                 log.info("Charging stopped externally → PV_WAIT")
+                self._exit_force_battery_override()
                 self.mode = Mode.PV_WAIT
                 self.daemon_started_charging = False
                 self.surplus_above_min_since = None
@@ -592,7 +719,7 @@ class SolarCharger:
                     # Not actually charging right now (paused, fully charged,
                     # or a brief comms hiccup) but surplus is sufficient -
                     # keep nudging. Idempotent, so no "already tried once"
-                    # bookkeeping is needed (that was the v2.0.1 bug).
+                    # bookkeeping is needed (that was the earlier bug).
                     log.info(f"Nudging charge start at {target_a:.1f}A (surplus {surplus_w:.0f}W)")
                     set_current(client, target_a)
                     start_charging(client)
