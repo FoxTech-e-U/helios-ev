@@ -127,6 +127,10 @@ POLL_INTERVAL      = 10     # seconds between control loop iterations
 START_HYSTERESIS_S = 60     # seconds surplus must be stable before starting
 STOP_HYSTERESIS_S  = 300    # seconds surplus must be below minimum before pausing
 MODBUS_TIMEOUT_S   = 120    # seconds - write to 0x4106 to keep ABB alive
+MAX_CURRENT_STEP_A = 3      # max change per adjustment - abrupt jumps (e.g. +6A in
+                             # one step) can cause a real load-step transient that
+                             # briefly draws from the battery even with genuine PV
+                             # surplus available, before the system settles
 
 # Grid power: real import/export at the Multiplus AC-In, post battery-
 # priority. Negative = export = genuine surplus (requires free feed-in).
@@ -444,7 +448,7 @@ class SolarCharger:
         svc = VeDbusService('com.victronenergy.evcharger.abb_terra_ac_2', register=False)
 
         svc.add_path('/Mgmt/ProcessName', __file__)
-        svc.add_path('/Mgmt/ProcessVersion', '2.5.0-exclusive-rtu')
+        svc.add_path('/Mgmt/ProcessVersion', '2.5.1-exclusive-rtu')
         svc.add_path('/Mgmt/Connection', f'Modbus RTU {MODBUS_PORT}:{MODBUS_ADDRESS}')
         svc.add_path('/DeviceInstance', DEVICE_INSTANCE)
         svc.add_path('/ProductId', 0xB044)
@@ -785,18 +789,7 @@ class SolarCharger:
                 self.surplus_above_min_since = None
 
         elif self.mode == Mode.PV_CHARGE:
-            battery_discharging = battery_w is not None and battery_w < -BATTERY_DISCHARGE_TOLERANCE_W
-            if battery_discharging:
-                # Safety: don't wait out the normal 300s hysteresis while
-                # the battery is actively being drained - stop right away.
-                log.warning(f"Battery discharging {-battery_w:.0f}W during PV_CHARGE → "
-                            f"immediate stop (bypassing normal hysteresis)")
-                stop_charging(client)
-                self.mode = Mode.PV_WAIT
-                self.surplus_above_min_since = None
-                self.surplus_below_min_since = None
-                self.daemon_started_charging = False
-            elif target_a >= MIN_CURRENT:
+            if target_a >= MIN_CURRENT:
                 self.surplus_below_min_since = None
                 current_a = self.service['/Current'] or 0
                 if current_a == 0 or state != STATE_CHARGING:
@@ -808,9 +801,11 @@ class SolarCharger:
                     set_current(client, target_a)
                     start_charging(client)
                 elif abs(target_a - current_a) > 0.5:
-                    log.info(f"Adjusting charge current: {current_a:.1f}A → {target_a:.1f}A "
-                             f"(surplus {surplus_w:.0f}W)")
-                    set_current(client, target_a)
+                    step = max(-MAX_CURRENT_STEP_A, min(MAX_CURRENT_STEP_A, target_a - current_a))
+                    new_a = current_a + step
+                    log.info(f"Adjusting charge current: {current_a:.1f}A → {new_a:.1f}A "
+                             f"(Ziel {target_a:.1f}A, surplus {surplus_w:.0f}W)")
+                    set_current(client, new_a)
             else:
                 if self.surplus_below_min_since is None:
                     self.surplus_below_min_since = now
