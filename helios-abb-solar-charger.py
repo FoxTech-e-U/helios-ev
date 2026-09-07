@@ -472,7 +472,7 @@ class SolarCharger:
         svc = VeDbusService('com.victronenergy.evcharger.abb_terra_ac_2', register=False)
 
         svc.add_path('/Mgmt/ProcessName', __file__)
-        svc.add_path('/Mgmt/ProcessVersion', '2.7.0-exclusive-rtu')
+        svc.add_path('/Mgmt/ProcessVersion', '2.7.1-exclusive-rtu')
         svc.add_path('/Mgmt/Connection', f'Modbus RTU {MODBUS_PORT}:{MODBUS_ADDRESS}')
         svc.add_path('/DeviceInstance', DEVICE_INSTANCE)
         svc.add_path('/ProductId', 0xB044)
@@ -828,7 +828,21 @@ class SolarCharger:
                 self.surplus_above_min_since = None
 
         elif self.mode == Mode.PV_CHARGE:
-            if target_a >= MIN_CURRENT:
+            if battery_soc is not None and battery_soc < MIN_BATTERY_SOC_FOR_CHARGING:
+                # SOC is not a noisy/transient signal like the grid reading
+                # can be - it changes slowly and is a firm policy decision
+                # ("battery first"), so there is no flapping risk in
+                # stopping immediately rather than waiting out the normal
+                # 300s hysteresis meant for fluctuating surplus values.
+                log.info(f"Battery SOC {battery_soc:.0f}% below "
+                         f"{MIN_BATTERY_SOC_FOR_CHARGING}% priority threshold → "
+                         f"immediate stop (no hysteresis needed for a stable signal)")
+                stop_charging(client)
+                self.mode = Mode.PV_WAIT
+                self.surplus_above_min_since = None
+                self.surplus_below_min_since = None
+                self.daemon_started_charging = False
+            elif target_a >= MIN_CURRENT:
                 self.surplus_below_min_since = None
                 current_a = self.service['/Current'] or 0
                 if current_a == 0 or state != STATE_CHARGING:
