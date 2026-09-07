@@ -134,8 +134,16 @@ MAX_CURRENT_STEP_A = 3      # max change per adjustment - abrupt jumps (e.g. +6A
 
 # Grid power: real import/export at the Multiplus AC-In, post battery-
 # priority. Negative = export = genuine surplus (requires free feed-in).
-GRID_SERVICE = 'com.victronenergy.system'
-GRID_PATHS   = ['/Ac/Grid/L1/Power', '/Ac/Grid/L2/Power', '/Ac/Grid/L3/Power']
+# Grid power: read directly from the Multiplus vebus AC-In, not from the
+# com.victronenergy.system aggregation. Discovered 2026-09-07: the system
+# service's /Ac/Grid/Lx/Power was actually reflecting AC-Out (house side,
+# including the wallbox's own load) rather than AC-In (the real grid
+# connection) - explaining "impossible" surplus readings that no PV array
+# could actually produce. The vebus AC-In values match what the Cerbo's own
+# local display and Multiplus AC-In readout show directly.
+# Verify your own vebus service name with: dbus -y | grep vebus
+GRID_SERVICE = 'com.victronenergy.vebus.ttyS4'
+GRID_PATHS   = ['/Ac/ActiveIn/L1/P', '/Ac/ActiveIn/L2/P', '/Ac/ActiveIn/L3/P']
 
 # Safety gate: the grid-based surplus formula assumes any negative grid
 # reading is genuine untapped PV surplus. That assumption breaks down when
@@ -150,6 +158,18 @@ GRID_PATHS   = ['/Ac/Grid/L1/Power', '/Ac/Grid/L2/Power', '/Ac/Grid/L3/Power']
 BATTERY_SERVICE = 'com.victronenergy.system'
 BATTERY_PATH    = '/Dc/Battery/Power'   # positive = charging, negative = discharging
 BATTERY_DISCHARGE_TOLERANCE_W = 50      # small noise band around zero
+
+# Battery gets priority over the EVCS, full stop - this was the original
+# premise from day one ("nur wenn der Speicher voll ist"). Checking the
+# Grid value alone is not a reliable proxy for "battery is satisfied": an
+# external ESS setpoint control (Dynamic ESS, tariff automation, etc.) can
+# target near-zero grid flow independently of the battery's actual state,
+# making the grid look like it has "surplus" while the battery is still far
+# from full and would otherwise want that power. Checking SOC directly does
+# not depend on what any external control loop is doing to the grid number.
+BATTERY_SOC_PATH             = '/Dc/Battery/Soc'
+MIN_BATTERY_SOC_FOR_CHARGING = 98   # % - tune to your battery/BMS; many
+                                     # systems never quite report a clean 100
 
 # ESS Battery-Life override used during FORCE mode (see docstring above).
 # Fill in once known: dbus -y com.victronenergy.settings
@@ -273,6 +293,10 @@ def get_grid_power():
 def get_battery_power():
     """Return battery power in W. Positive = charging, negative = discharging."""
     return dbus_get(BATTERY_SERVICE, BATTERY_PATH)
+
+def get_battery_soc():
+    """Return battery state of charge in %, or None if unavailable."""
+    return dbus_get(BATTERY_SERVICE, BATTERY_SOC_PATH)
 
 # =============================================================================
 # Battery-Life override persistence (survives a crash mid-FORCE-session)
@@ -448,7 +472,7 @@ class SolarCharger:
         svc = VeDbusService('com.victronenergy.evcharger.abb_terra_ac_2', register=False)
 
         svc.add_path('/Mgmt/ProcessName', __file__)
-        svc.add_path('/Mgmt/ProcessVersion', '2.5.1-exclusive-rtu')
+        svc.add_path('/Mgmt/ProcessVersion', '2.7.0-exclusive-rtu')
         svc.add_path('/Mgmt/Connection', f'Modbus RTU {MODBUS_PORT}:{MODBUS_ADDRESS}')
         svc.add_path('/DeviceInstance', DEVICE_INSTANCE)
         svc.add_path('/ProductId', 0xB044)
@@ -699,10 +723,25 @@ class SolarCharger:
         surplus_w = -grid_w + charging_w
         target_a  = self.calculate_target_current(surplus_w)
 
-        # --- Safety gate: never charge while the battery is actually
-        #     discharging, no matter what the grid formula claims (see
-        #     BATTERY_DISCHARGE_TOLERANCE_W comment above for why this is
-        #     necessary). ---
+        # --- Priority gate: the battery gets PV surplus before the vehicle
+        #     does, full stop. Checked directly against SOC, not inferred
+        #     from the grid reading - an external ESS setpoint control can
+        #     make the grid look like it has surplus independently of
+        #     whether the battery actually wants that power. ---
+        battery_soc = get_battery_soc()
+        if battery_soc is not None and battery_soc < MIN_BATTERY_SOC_FOR_CHARGING:
+            if target_a > 0:
+                log.info(f"Battery SOC {battery_soc:.0f}% is below the "
+                         f"{MIN_BATTERY_SOC_FOR_CHARGING}% priority threshold - battery "
+                         f"comes first, ignoring apparent grid surplus")
+            target_a = 0.0
+        elif battery_soc is None:
+            log.warning("Could not read battery SOC - proceeding without the "
+                        "SOC priority gate this cycle")
+
+        # --- Secondary safety gate: never charge while the battery is
+        #     actually discharging either, regardless of SOC or what the
+        #     grid formula claims (covers cases SOC alone might miss). ---
         battery_w = get_battery_power()
         if battery_w is not None and battery_w < -BATTERY_DISCHARGE_TOLERANCE_W:
             if target_a > 0:
