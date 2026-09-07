@@ -133,6 +133,20 @@ MODBUS_TIMEOUT_S   = 120    # seconds - write to 0x4106 to keep ABB alive
 GRID_SERVICE = 'com.victronenergy.system'
 GRID_PATHS   = ['/Ac/Grid/L1/Power', '/Ac/Grid/L2/Power', '/Ac/Grid/L3/Power']
 
+# Safety gate: the grid-based surplus formula assumes any negative grid
+# reading is genuine untapped PV surplus. That assumption breaks down when
+# an external ESS setpoint control (Dynamic ESS, tariff automation, etc.)
+# is actively targeting near-zero grid flow and permits battery discharge
+# to get there - the grid can show export while the battery is
+# simultaneously being drained to meet that setpoint. Observed in practice:
+# Grid=-4870W (looks like surplus) while Battery=-6318W (actively
+# discharging) at the same time. So: never command a charge current while
+# the battery is actually discharging, regardless of what the grid formula
+# says.
+BATTERY_SERVICE = 'com.victronenergy.system'
+BATTERY_PATH    = '/Dc/Battery/Power'   # positive = charging, negative = discharging
+BATTERY_DISCHARGE_TOLERANCE_W = 50      # small noise band around zero
+
 # ESS Battery-Life override used during FORCE mode (see docstring above).
 # Fill in once known: dbus -y com.victronenergy.settings
 #   /Settings/CGwacs/BatteryLife/State GetValue
@@ -251,6 +265,10 @@ def get_grid_power():
             return None
         total += p
     return total
+
+def get_battery_power():
+    """Return battery power in W. Positive = charging, negative = discharging."""
+    return dbus_get(BATTERY_SERVICE, BATTERY_PATH)
 
 # =============================================================================
 # Battery-Life override persistence (survives a crash mid-FORCE-session)
@@ -426,7 +444,7 @@ class SolarCharger:
         svc = VeDbusService('com.victronenergy.evcharger.abb_terra_ac_2', register=False)
 
         svc.add_path('/Mgmt/ProcessName', __file__)
-        svc.add_path('/Mgmt/ProcessVersion', '2.3.1-exclusive-rtu')
+        svc.add_path('/Mgmt/ProcessVersion', '2.5.0-exclusive-rtu')
         svc.add_path('/Mgmt/Connection', f'Modbus RTU {MODBUS_PORT}:{MODBUS_ADDRESS}')
         svc.add_path('/DeviceInstance', DEVICE_INSTANCE)
         svc.add_path('/ProductId', 0xB044)
@@ -507,7 +525,17 @@ class SolarCharger:
         state = None
         if status_raw is not None:
             svc['/Status'] = status_raw
-            state = status_raw & 0x7F
+            # BUGFIX: the actual state byte is the second-lowest byte of the
+            # 32-bit register value, not the lowest. Verified against real
+            # observed values: 0x8500 -> byte 0x85 -> state 5 ("stopped
+            # externally", matches a plugged-in, paused vehicle); 0x8100 ->
+            # byte 0x81 -> state 1 ("plugged, pending auth"). The previous
+            # `status_raw & 0x7F` masked the lowest byte, which is 0x00 in
+            # both of those real examples - meaning the daemon read
+            # STATE_IDLE almost regardless of the real state. This likely
+            # explains much of today's "won't start" / inconsistent FORCE
+            # detection behaviour.
+            state = (status_raw >> 8) & 0x7F
             ok_any = True
         time.sleep(0.1)
 
@@ -667,7 +695,24 @@ class SolarCharger:
         surplus_w = -grid_w + charging_w
         target_a  = self.calculate_target_current(surplus_w)
 
+        # --- Safety gate: never charge while the battery is actually
+        #     discharging, no matter what the grid formula claims (see
+        #     BATTERY_DISCHARGE_TOLERANCE_W comment above for why this is
+        #     necessary). ---
+        battery_w = get_battery_power()
+        if battery_w is not None and battery_w < -BATTERY_DISCHARGE_TOLERANCE_W:
+            if target_a > 0:
+                log.warning(f"Grid formula claims {surplus_w:.0f}W surplus but battery is "
+                            f"discharging {-battery_w:.0f}W at the same time - ignoring "
+                            f"surplus, treating as 0 (an external ESS setpoint/Dynamic ESS "
+                            f"control may be active)")
+            target_a = 0.0
+        elif battery_w is None:
+            log.warning("Could not read battery power - proceeding without the "
+                        "battery safety gate this cycle")
+
         log.debug(f"State={state} Mode={self.mode.value} Grid={grid_w:.0f}W "
+                  f"Battery={battery_w if battery_w is not None else 'N/A'}W "
                   f"Surplus={surplus_w:.0f}W Target={target_a:.1f}A")
 
         # --- Keepalive ---
@@ -740,7 +785,18 @@ class SolarCharger:
                 self.surplus_above_min_since = None
 
         elif self.mode == Mode.PV_CHARGE:
-            if target_a >= MIN_CURRENT:
+            battery_discharging = battery_w is not None and battery_w < -BATTERY_DISCHARGE_TOLERANCE_W
+            if battery_discharging:
+                # Safety: don't wait out the normal 300s hysteresis while
+                # the battery is actively being drained - stop right away.
+                log.warning(f"Battery discharging {-battery_w:.0f}W during PV_CHARGE → "
+                            f"immediate stop (bypassing normal hysteresis)")
+                stop_charging(client)
+                self.mode = Mode.PV_WAIT
+                self.surplus_above_min_since = None
+                self.surplus_below_min_since = None
+                self.daemon_started_charging = False
+            elif target_a >= MIN_CURRENT:
                 self.surplus_below_min_since = None
                 current_a = self.service['/Current'] or 0
                 if current_a == 0 or state != STATE_CHARGING:
